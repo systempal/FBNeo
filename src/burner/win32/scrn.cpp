@@ -23,6 +23,9 @@ void DisplayPopupMenu(int nMenu);
 // it.
 // 3: only compatible with "side" bezels with nothing on top/bottom.
 // note: only works with "Video -> Stretch -> Correct Aspect Ratio"!
+// 4: problems with the "Enhanced" blitter: not showing bezel or parts
+// go missing
+//
 //
 // on sizing of window
 //~
@@ -39,6 +42,8 @@ void DisplayPopupMenu(int nMenu);
 // can also be problematic, sometimes creating a window that is too wide.
 
 static HBITMAP hBezelBitmap = NULL;
+static int nBezelCacheX = 0;
+static int nBezelCacheY = 0;
 
 RECT SystemWorkArea = { 0, 0, 640, 480 };				// Work area on the desktop
 int nWindowPosX = -1, nWindowPosY = -1;					// Window position
@@ -47,6 +52,7 @@ int bAutoPause = 1;
 
 bool bMenuEnabled = true;
 bool bHasFocus = false;
+int bKailleraServerDialogActive = 0;
 
 int nSavestateSlot = 1;
 
@@ -292,14 +298,13 @@ static void WINAPI kDropCallback(char *nick, int playernb)
 	VidSAddChatMsg(szTemp, 0xFFFFFF, NULL, 0);
 }
 
-static int bServerDialogActive = 0;
 static char* kaillera_gameList = NULL;
 
 static unsigned __stdcall DoKailleraServerSelectThread(void *arg)
 {
-	bServerDialogActive = 1;
+	bKailleraServerDialogActive = 1;
 	Kaillera_Select_Server_Dialog(NULL);
-	bServerDialogActive = 0;
+	bKailleraServerDialogActive = 0;
 
 	// clean up
 	if (kaillera_gameList) {
@@ -319,11 +324,11 @@ static void KailleraServerSelect()
 	HANDLE hThread = NULL;
 	unsigned ThreadID = 0;
 
-	bServerDialogActive = 0;
+	bKailleraServerDialogActive = 0;
 
 	hThread = (HANDLE)_beginthreadex(NULL, 0, DoKailleraServerSelectThread, (void*)NULL, 0, &ThreadID);
 
-	while (bServerDialogActive == 0) { // wait for thread to start :)
+	while (bKailleraServerDialogActive == 0) { // wait for thread to start :)
 		Sleep(1);
 	}
 }
@@ -513,10 +518,12 @@ static bool VidInitNeeded()
 	if (nVidSelect == 1 && (nVidBlitterOpt[nVidSelect] & 0x00030000) == 0x00030000) {
 		return true;
 	}
+#if 0
+	// why?? (seems to cause trouble) -dink june 2024
 	if (nVidSelect == 3) {
 		return true;
 	}
-
+#endif
 	return false;
 }
 
@@ -794,10 +801,65 @@ static INT32 ScrnHasBezel()
 	return 0;
 }
 
+struct t_hw_Struct {
+	char system[80];
+	UINT32 hw[8];
+};
+
+static t_hw_Struct scrn_gamehw_cfg[] = {
+	{ "megadrive",	{ HARDWARE_SEGA_MEGADRIVE, 0 } },
+	{ "pce",		{ HARDWARE_PCENGINE_PCENGINE, 0 } },
+	{ "tg16",		{ HARDWARE_PCENGINE_TG16, 0 } },
+	{ "sgx",		{ HARDWARE_PCENGINE_SGX, 0 } },
+	{ "sg1000",		{ HARDWARE_SEGA_SG1000, 0 } },
+	{ "coleco",		{ HARDWARE_COLECO, 0 } },
+	{ "sms",		{ HARDWARE_SEGA_MASTER_SYSTEM, 0 } },
+	{ "gamegear",	{ HARDWARE_SEGA_GAME_GEAR, 0 } },
+	{ "msx",		{ HARDWARE_MSX, 0 } },
+	{ "spectrum",	{ HARDWARE_SPECTRUM, 0 } },
+	{ "nes",		{ HARDWARE_NES, 0 } },
+	{ "fds",		{ HARDWARE_FDS, 0 } },
+	{ "ngp",		{ HARDWARE_SNK_NGP, HARDWARE_SNK_NGPC, 0 } },
+	{ "channelf",	{ HARDWARE_CHANNELF, 0 } },
+	{ "cps1",		{ HARDWARE_CAPCOM_CPS1, HARDWARE_CAPCOM_CPS1_QSOUND, HARDWARE_CAPCOM_CPS1_GENERIC, HARDWARE_CAPCOM_CPSCHANGER, 0 } },
+	{ "cps2",		{ HARDWARE_CAPCOM_CPS2, 0 } },
+	{ "cps3",		{ HARDWARE_CAPCOM_CPS3, 0 } },
+	{ "pgm",		{ HARDWARE_IGS_PGM, 0 } },
+	{ "neogeo",		{ HARDWARE_SNK_NEOGEO, HARDWARE_SNK_MVS, HARDWARE_SNK_DEDICATED_PCB, 0 } },
+	{ "neogeocd",	{ HARDWARE_SNK_NEOCD, 0 } },
+	{ "arcade",		{ ~0, 0 } }, // default, if not found above
+	{ "\0", { 0 } } // end
+};
+
+static char *ScrnGetHWString(UINT32 nHWCode)
+{
+	// See if nHWCode belongs to any systems in scrn_gamehw_cfg
+	for (INT32 i = 0; scrn_gamehw_cfg[i].system[0] != '\0'; i++) {
+		for (INT32 hw = 0; scrn_gamehw_cfg[i].hw[hw] != 0; hw++) {
+			if (scrn_gamehw_cfg[i].hw[hw] == nHWCode || scrn_gamehw_cfg[i].hw[hw] == ~0)
+			{
+				return scrn_gamehw_cfg[i].system;
+			}
+		}
+	}
+	return NULL;
+}
+
 static void HandleBezelLoading(HWND hWnd, int cx, int cy)
 {
 	// handle bezel loading
-	hBezelBitmap = NULL;
+	if (!bDrvOkay) {
+		// clear cache
+		hBezelBitmap = NULL;
+		nBezelCacheX = 0;
+		nBezelCacheY = 0;
+		return;
+	}
+	// check cache
+	if (hBezelBitmap && (nBezelCacheX == cx && nBezelCacheY == cy - nMenuHeight)) {
+		// cached, nothing to do here
+		return;
+	}
 
 	if (bDrvOkay && !(hScrnWnd == NULL || nVidFullscreen)) {
 		char* pszName = BurnDrvGetTextA(DRV_NAME);
@@ -806,9 +868,38 @@ static void HandleBezelLoading(HWND hWnd, int cx, int cy)
 		sprintf(szName, "support/bezel/%s.png", pszName);
 
 		FILE *fp = fopen(szName, "rb");
+
+		if (!fp && BurnDrvGetTextA(DRV_PARENT)) {
+			// File doesn't exist, so try parent name
+			pszName = BurnDrvGetTextA(DRV_PARENT);
+			sprintf(szName, "support/bezel/%s.png", pszName);
+			fp = fopen(szName, "rb");
+		}
+
+		if (!fp) {
+			// File doesn't exist, try to use system bezel
+			szName[0] = 0;
+
+			pszName = ScrnGetHWString(BurnDrvGetHardwareCode() & HARDWARE_PUBLIC_MASK);
+
+			if (pszName != NULL) {
+				if (BurnDrvGetFlags() & BDF_ORIENTATION_VERTICAL) {
+					sprintf(szName, "support/bezel/%s_v.png", pszName);
+				} else {
+					sprintf(szName, "support/bezel/%s.png", pszName);
+				}
+			}
+
+			if (szName[0] != '\0') {
+				fp = fopen(szName, "rb");
+			}
+		}
+
 		if (fp) {
 			bprintf(0, _T("Loading bezel \"%S\"\n"), szName);
 			hBezelBitmap = PNGLoadBitmap(hWnd, fp, cx, cy - nMenuHeight, 0);
+			nBezelCacheX = cx;
+			nBezelCacheY = cy - nMenuHeight;
 			fclose(fp);
 		}
 	}
@@ -866,9 +957,6 @@ static void OnDestroy(HWND)
     VidExit();							// Stop using video with the Window
     hScrnWnd = NULL;					// Make sure handle is not used again
 }
-
-OPENFILENAME	bgFn;
-TCHAR			szFile[MAX_PATH];
 
 static void UpdatePreviousGameList()
 {
@@ -1260,6 +1348,10 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 		}
 
 		case MENU_STARTNET:
+			if (bKailleraServerDialogActive) {
+				// Kaillera server dialog already open!
+				break;
+			}
 			if (Init_Network()) {
 				MessageBox(hScrnWnd, FBALoadStringEx(hAppInst, IDS_ERR_NO_NETPLAYDLL, true), FBALoadStringEx(hAppInst, IDS_ERR_ERROR, true), MB_OK);
 				break;
@@ -1551,6 +1643,11 @@ static void OnCommand(HWND /*hDlg*/, int id, HWND /*hwndCtl*/, UINT codeNotify)
 
 		case MENU_TRIPLE:
 			bVidTripleBuffer = !bVidTripleBuffer;
+			POST_INITIALISE_MESSAGE;
+			break;
+
+		case MENU_WINFS:
+			bVidDX9WinFullscreen = !bVidDX9WinFullscreen;
 			POST_INITIALISE_MESSAGE;
 			break;
 
